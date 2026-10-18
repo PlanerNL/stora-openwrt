@@ -1,0 +1,22 @@
+"""
+stora-patch.py - adds the extra pages to an OpenWrt firmware for the Netgear Stora
+
+Adds to the firmware file, before you flash it:
+  - Services > Disks & RAID   (prepare disks, RAID 0/1, SMART, share users)
+  - System > Shut down        (and a working power button: the Stora really
+                               switches off instead of only halting)
+
+Works on Windows, macOS and Linux with Python 3.8 or newer; nothing else
+has to be installed.
+
+Usage:
+  Windows:        py stora-patch.py <firmware-sysupgrade.bin>
+  macOS / Linux:  python3 stora-patch.py <firmware-sysupgrade.bin>
+
+The result is written next to the input as <name>-patched.bin (or give a
+second file name). Flash that file in the web interface under
+System > Backup / Flash Firmware > Flash image.
+
+The input must be an OpenWrt "sysupgrade" image for the Netgear Stora,
+for example one built with https://firmware-selector.openwrt.org .
+"""

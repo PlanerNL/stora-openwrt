@@ -1,0 +1,6 @@
+#!/bin/sh
+# Stora: mark this as a real power-off, so /etc/init.d/stora-power can cut
+# the power at the very end of the shutdown (the kernel cannot: its device
+# tree points the power-off line at the wrong GPIO bank).
+touch /tmp/.stora-poweroff
+exec /bin/busybox poweroff "$@"

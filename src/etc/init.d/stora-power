@@ -1,0 +1,31 @@
+#!/bin/sh /etc/rc.common
+# Cuts the power of a Netgear Stora at the end of a shutdown started with
+# poweroff (power button, LuCI "Shut down", or the poweroff command).
+# The power-off line is MPP40 = GPIO 40, active high.
+
+# STOP=89: run just before K90umount, which may unmount /sys and /tmp.
+START=99
+STOP=89
+
+start() {
+	rm -f /tmp/.stora-poweroff
+}
+
+stop() {
+	[ -f /tmp/.stora-poweroff ] || return 0
+	case "$(cat /tmp/sysinfo/board_name 2>/dev/null)" in
+		*stora*) ;;
+		*) return 0 ;;
+	esac
+	local m
+	sync
+	for m in $(awk '$2 ~ "^/mnt/" {print $2}' /proc/mounts | sort -r); do
+		umount "$m" 2>/dev/null || umount -l "$m"
+	done
+	command -v mdadm >/dev/null && mdadm --stop --scan >/dev/null 2>&1
+	sync
+	sleep 1
+	[ -d /sys/class/gpio/gpio40 ] || echo 40 > /sys/class/gpio/export
+	echo high > /sys/class/gpio/gpio40/direction
+	sleep 5
+}

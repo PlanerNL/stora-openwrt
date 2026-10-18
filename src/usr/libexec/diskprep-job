@@ -1,0 +1,337 @@
+#!/bin/sh
+# diskprep-job - runs the long-running disk actions for luci-app-diskprep.
+# Started by /usr/libexec/rpcd/luci.diskprep; all output goes to
+# /tmp/diskprep.log, the final state (ok/error) to /tmp/diskprep.state.
+#
+#   diskprep-job create <single|raid0|raid1> <name> <share 0|1> <sharename> <disk>...
+#   diskprep-job remove <mdN>
+
+LOG=/tmp/diskprep.log
+STATE=/tmp/diskprep.state
+exec >>"$LOG" 2>&1 </dev/null
+
+. /lib/functions.sh
+
+KSMBD_STOPPED=""
+
+say()  { echo "$*"; }
+step() { echo; echo "==> $*"; }
+fail() {
+	echo
+	echo "FAILED: $*"
+	[ -n "$KSMBD_STOPPED" ] && /etc/init.d/ksmbd start >/dev/null 2>&1
+	echo error > "$STATE"
+	exit 1
+}
+run()  { echo "# $*"; "$@" || fail "command failed: $*"; }
+
+mnts_of() { # /dev/x -> all mount points
+	awk -v d="$1" '$1==d {print $2}' /proc/mounts
+}
+
+umount_dev() { # /dev/x
+	local m
+	for m in $(mnts_of "$1" | sort -r); do
+		say "Unmounting $1 from $m"
+		umount "$m" 2>/dev/null || umount -l "$m" || fail "cannot unmount $m"
+	done
+}
+
+blk_uuid() { # /dev/x
+	block info 2>/dev/null | sed -n "s#^$1:.* UUID=\"\([^\"]*\)\".*#\1#p" | head -n 1
+}
+
+stop_ksmbd() {
+	if [ -x /etc/init.d/ksmbd ] && pidof ksmbd.mountd >/dev/null 2>&1; then
+		step "Temporarily stopping network sharing"
+		/etc/init.d/ksmbd stop >/dev/null 2>&1
+		KSMBD_STOPPED=1
+	fi
+}
+
+start_ksmbd() {
+	if [ -x /etc/init.d/ksmbd ] && { [ -n "$KSMBD_STOPPED" ] || /etc/init.d/ksmbd enabled; }; then
+		step "(Re)starting network sharing"
+		/etc/init.d/ksmbd restart >/dev/null 2>&1
+		KSMBD_STOPPED=""
+	fi
+}
+
+# Remove settings (mount points, network shares, RAID entries) that refer to
+# devices, UUIDs or directories listed in $MATCH (space separated).
+# $MNTS holds old mount points: shares at or below them are removed too.
+cleanup_config() {
+	DEL=""
+
+	_chk_mount() {
+		local v o t
+		for o in target uuid device; do
+			config_get v "$1" "$o"
+			[ -n "$v" ] || continue
+			case " $MATCH " in
+				*" $v "*)
+					DEL="$DEL fstab.$1"
+					config_get t "$1" target
+					[ -n "$t" ] && MNTS="$MNTS $t"
+					return
+				;;
+			esac
+		done
+	}
+	_chk_share() {
+		local v n m
+		config_get v "$1" path
+		config_get n "$1" name
+		if [ -n "$DROP_SHARE" ] && [ "$n" = "$DROP_SHARE" ]; then DEL="$DEL ksmbd.$1"; return; fi
+		[ -n "$v" ] || return
+		for m in $MNTS; do
+			case "$v" in "$m"|"$m"/*) DEL="$DEL ksmbd.$1"; return ;; esac
+		done
+	}
+	_chk_array() {
+		local v o
+		for o in device uuid; do
+			config_get v "$1" "$o"
+			[ -n "$v" ] || continue
+			case " $MATCH " in *" $v "*) DEL="$DEL mdadm.$1"; return ;; esac
+		done
+	}
+
+	config_load fstab 2>/dev/null && { config_foreach _chk_mount mount; config_foreach _chk_mount swap; }
+	config_load ksmbd 2>/dev/null && config_foreach _chk_share share
+	config_load mdadm 2>/dev/null && config_foreach _chk_array array
+
+	local s
+	for s in $DEL; do
+		say "Removed old setting: $s"
+		uci -q delete "$s"
+	done
+	uci -q commit fstab
+	uci -q commit ksmbd
+	uci -q commit mdadm
+}
+
+do_create() {
+	local mode=$1 label=$2 share=$3 sharename=$4
+	shift 4
+	local disks="$*" target="/mnt/$label" md ok d p u m part parts="" dev n lvl cnt mduuid fsuuid sid i
+
+	step "Preparing: $mode on $disks, name '$label'"
+
+	# Record current usage so old settings can be cleaned up
+	MATCH="$target" MNTS="$target" OLDDEVS=""
+	for d in $disks; do
+		for p in /dev/$d /dev/$d[0-9]*; do
+			[ -b "$p" ] || continue
+			OLDDEVS="$OLDDEVS $p"
+			u=$(blk_uuid "$p")
+			m=$(mnts_of "$p")
+			MATCH="$MATCH $p $u $m"
+			MNTS="$MNTS $m"
+		done
+	done
+
+	stop_ksmbd
+
+	step "Unmounting disks"
+	for p in $OLDDEVS; do umount_dev "$p"; done
+	for p in $OLDDEVS; do
+		if grep -q "^$p " /proc/swaps 2>/dev/null; then
+			say "Disabling swap on $p"
+			swapoff "$p" || fail "cannot disable swap on $p"
+		fi
+	done
+	if [ -n "$(awk -v t="$target" '$2==t' /proc/mounts)" ]; then
+		fail "$target is in use by another disk. Choose a different name."
+	fi
+
+	for d in $disks; do
+		step "Erasing and partitioning disk $d (one partition, GPT)"
+		run dd if=/dev/zero of=/dev/$d bs=1M count=4
+		sync
+		sleep 2
+		ok=0
+		if printf 'g\nn\n\n\n\nw\n' | fdisk -w always -W always /dev/$d; then
+			ok=1
+		else
+			# The partition table is already on disk; only the kernel reload failed
+			# (something was reading the disk at that moment). Retry a few times.
+			for i in 1 2 3 4 5; do
+				say "Asking the kernel to re-read the partition table (attempt $i)..."
+				sleep 3
+				if printf 'w\n' | fdisk /dev/$d >/dev/null 2>&1; then ok=1; break; fi
+			done
+		fi
+		if [ $ok != 1 ]; then
+			say ""
+			say "The kernel could not load the new partition table of $d; something is still using the disk:"
+			grep "^/dev/$d" /proc/swaps /proc/mounts 2>/dev/null
+			ls /sys/block/$d/holders /sys/block/$d/$d*/holders 2>/dev/null
+			fail "partitioning $d failed (reboot the device and try again)"
+		fi
+		part=/dev/${d}1
+		i=0
+		while [ ! -b "$part" ] && [ $i -lt 20 ]; do sleep 1; i=$((i + 1)); done
+		[ -b "$part" ] || fail "partition $part did not appear"
+		run dd if=/dev/zero of=$part bs=1M count=4
+		parts="$parts $part"
+	done
+	sync
+
+	if [ "$mode" = single ]; then
+		dev=${parts# }
+	else
+		lvl=${mode#raid}
+		modprobe md-mod >/dev/null 2>&1
+		modprobe raid$lvl >/dev/null 2>&1
+		n=0
+		while grep -q "^md$n " /proc/mdstat 2>/dev/null || [ -e /sys/block/md$n/md/level ]; do
+			n=$((n + 1))
+		done
+		dev=/dev/md$n
+		cnt=$(echo $parts | wc -w)
+		step "Creating RAID $lvl volume $dev from$parts"
+		run mdadm --create "$dev" --run --level="$lvl" --raid-devices="$cnt" --metadata=1.2 --name="$label" $parts
+		i=0
+		while [ ! -b "$dev" ] && [ $i -lt 10 ]; do sleep 1; i=$((i + 1)); done
+	fi
+
+	step "Creating ext4 file system on $dev (name: $label)"
+	# Pause RAID sync for a moment, otherwise mkfs and the sync fight over the disks
+	md=${dev#/dev/}
+	if [ -w "/sys/block/$md/md/sync_action" ]; then
+		echo frozen > "/sys/block/$md/md/sync_action" 2>/dev/null
+	fi
+	say "This may take a few minutes..."
+	run mkfs.ext4 -q -F -L "$label" -m 0 -E lazy_itable_init=1,lazy_journal_init=1 "$dev"
+	sync
+	if [ -w "/sys/block/$md/md/sync_action" ]; then
+		echo idle > "/sys/block/$md/md/sync_action" 2>/dev/null
+	fi
+
+	if [ "$mode" != single ]; then
+		mduuid=$(mdadm --detail --export "$dev" | sed -n 's/^MD_UUID=//p')
+		[ -n "$mduuid" ] || fail "cannot read the UUID of $dev"
+		MATCH="$MATCH $dev $mduuid"
+	fi
+
+	step "Cleaning up old settings"
+	[ "$share" = 1 ] && DROP_SHARE="$sharename"
+	cleanup_config
+
+	if [ "$mode" != single ]; then
+		step "Registering the RAID volume so it comes back after a reboot"
+		sid=$(uci add mdadm array)
+		uci set mdadm.$sid.uuid="$mduuid"
+		uci set mdadm.$sid.device="$dev"
+		uci commit mdadm
+		/etc/init.d/mdadm enable
+		say "mdadm: $dev = $mduuid"
+	fi
+
+	step "Mounting on $target"
+	fsuuid=$(blk_uuid "$dev")
+	sid=$(uci add fstab mount)
+	uci set fstab.$sid.target="$target"
+	if [ -n "$fsuuid" ]; then
+		uci set fstab.$sid.uuid="$fsuuid"
+	else
+		uci set fstab.$sid.device="$dev"
+	fi
+	uci set fstab.$sid.options="noatime"
+	uci set fstab.$sid.enabled=1
+	uci commit fstab
+	mkdir -p "$target"
+	block mount >/dev/null 2>&1
+	if [ -z "$(awk -v t="$target" '$2==t' /proc/mounts)" ]; then
+		run mount -t ext4 -o noatime "$dev" "$target"
+	fi
+	chmod 0777 "$target"
+	say "Mounted $dev on $target"
+
+	if [ "$share" = 1 ]; then
+		step "Creating network share '$sharename'"
+		sid=$(uci add ksmbd share)
+		uci set ksmbd.$sid.name="$sharename"
+		uci set ksmbd.$sid.path="$target"
+		uci set ksmbd.$sid.read_only=no
+		uci set ksmbd.$sid.guest_ok=no
+		uci set ksmbd.$sid.browseable=yes
+		uci set ksmbd.$sid.create_mask=0666
+		uci set ksmbd.$sid.dir_mask=0777
+		uci commit ksmbd
+		/etc/init.d/ksmbd enable
+		KSMBD_STOPPED=1
+	fi
+
+	start_ksmbd
+
+	step "Done"
+	say "Volume '$label' ($dev) is mounted on $target."
+	[ "$share" = 1 ] && say "Network share: \\\\$(cat /proc/sys/kernel/hostname)\\$sharename"
+	if [ "$mode" = raid1 ]; then
+		say "RAID 1 is now syncing in the background (this can take hours)."
+		say "You can already use the volume in the meantime."
+	fi
+	echo ok > "$STATE"
+}
+
+do_remove() {
+	local md=$1 dev=/dev/$1 members m fsuuid mduuid
+	[ -e "/sys/block/$md/md" ] || fail "RAID volume $md does not exist"
+
+	step "Removing RAID volume $dev"
+	members=$(ls "/sys/block/$md/slaves" 2>/dev/null)
+	fsuuid=$(blk_uuid "$dev")
+	mduuid=$(mdadm --detail --export "$dev" 2>/dev/null | sed -n 's/^MD_UUID=//p')
+	MATCH="$dev $fsuuid $mduuid"
+	MNTS="$(mnts_of "$dev")"
+	for m in $MNTS; do MATCH="$MATCH $m"; done
+
+	# also look up mount points from the configuration
+	_find_target() {
+		local v o t
+		for o in uuid device; do
+			config_get v "$1" "$o"
+			[ -n "$v" ] || continue
+			case " $MATCH " in *" $v "*) config_get t "$1" target; MNTS="$MNTS $t"; return ;; esac
+		done
+	}
+	config_load fstab 2>/dev/null && config_foreach _find_target mount
+
+	stop_ksmbd
+	umount_dev "$dev"
+	for m in $MNTS; do
+		if [ -n "$(awk -v t="$m" '$2==t' /proc/mounts)" ]; then
+			say "Unmounting $m"
+			umount "$m" 2>/dev/null || umount -l "$m" || fail "cannot unmount $m"
+		fi
+	done
+	run mdadm --stop "$dev"
+
+	for m in $members; do
+		say "Releasing partition /dev/$m"
+		mdadm --zero-superblock "/dev/$m" 2>/dev/null
+		dd if=/dev/zero of="/dev/$m" bs=1M count=4 2>/dev/null
+	done
+	sync
+
+	step "Cleaning up settings"
+	cleanup_config
+	for m in $MNTS; do rmdir "$m" 2>/dev/null; done
+
+	start_ksmbd
+
+	step "Done"
+	say "RAID volume $md has been removed."
+	[ -n "$members" ] && say "Released partitions: $(echo $members). They can be reused now."
+	echo ok > "$STATE"
+}
+
+trap 'fail "task aborted"' INT TERM
+
+case "$1" in
+	create) shift; do_create "$@" ;;
+	remove) shift; do_remove "$@" ;;
+	*) fail "unknown command: $1" ;;
+esac

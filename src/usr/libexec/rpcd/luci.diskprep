@@ -1,0 +1,348 @@
+#!/bin/sh
+# rpcd plugin for luci-app-diskprep (Disks & RAID)
+# Quick actions (overview, users) run here directly; long-running disk
+# actions (erase, RAID, format) are started in the background via
+# /usr/libexec/diskprep-job, with progress in /tmp/diskprep.log.
+
+. /usr/share/libubox/jshn.sh
+. /lib/functions.sh
+
+JOB=/usr/libexec/diskprep-job
+LOG=/tmp/diskprep.log
+STATE=/tmp/diskprep.state
+PIDF=/var/run/diskprep.pid
+PWDDB=/etc/ksmbd/ksmbdpwd.db
+NL='
+'
+
+job_running() {
+	[ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null
+}
+
+mnt_of() {
+	awk -v d="/dev/$1" '$1==d {print $2; exit}' /proc/mounts
+}
+
+bval() { # device key  (from $BLK, output of 'block info')
+	printf '%s\n' "$BLK" | sed -n "s#^/dev/$1:.* $2=\"\([^\"]*\)\".*#\1#p" | head -n 1
+}
+
+has() {
+	command -v "$1" >/dev/null 2>&1 && echo 1 || echo 0
+}
+
+reply_error() {
+	json_init
+	json_add_string error "$1"
+	json_dump
+	exit 0
+}
+
+add_share() {
+	local name path
+	config_get name "$1" name
+	config_get path "$1" path
+	[ -n "$name" ] || return
+	json_add_object ""
+	json_add_string name "$name"
+	json_add_string path "$path"
+	json_close_object
+}
+
+do_list() {
+	local s d p pn md h m x u
+
+	# Do not probe all disks while a disk task runs: that can block the
+	# kernel from re-reading a new partition table ("Resource busy").
+	if job_running; then BLK=""; else BLK=$(block info 2>/dev/null); fi
+
+	json_init
+	json_add_boolean have_mdadm "$(has mdadm)"
+	json_add_boolean have_fdisk "$(has fdisk)"
+	json_add_boolean have_mkfs "$(has mkfs.ext4)"
+	json_add_boolean have_ksmbd "$(has ksmbd.adduser)"
+	json_add_boolean have_smart "$(has smartctl)"
+
+	json_add_array disks
+	for s in /sys/block/sd*; do
+		[ -e "$s" ] || continue
+		d=${s##*/}
+		json_add_object ""
+		json_add_string name "$d"
+		json_add_string sectors "$(cat "$s/size")"
+		json_add_string model "$(echo $(cat "$s/device/vendor" 2>/dev/null) $(cat "$s/device/model" 2>/dev/null))"
+		case "$(readlink -f "$s")" in
+			*/usb*) json_add_boolean usb 1 ;;
+			*)      json_add_boolean usb 0 ;;
+		esac
+		json_add_string type "$(bval "$d" TYPE)"
+		json_add_string mount "$(mnt_of "$d")"
+		md=""
+		for h in "$s"/holders/*; do [ -e "$h" ] && md=${h##*/}; done
+		json_add_string md "$md"
+		json_add_array parts
+		for p in "$s/$d"*; do
+			[ -e "$p/partition" ] || continue
+			pn=${p##*/}
+			md=""
+			for h in "$p"/holders/*; do [ -e "$h" ] && md=${h##*/}; done
+			json_add_object ""
+			json_add_string name "$pn"
+			json_add_string sectors "$(cat "$p/size")"
+			json_add_string type "$(bval "$pn" TYPE)"
+			json_add_string label "$(bval "$pn" LABEL)"
+			if grep -q "^/dev/$pn " /proc/swaps 2>/dev/null; then
+				json_add_string mount "[swap]"
+			else
+				json_add_string mount "$(mnt_of "$pn")"
+			fi
+			json_add_string md "$md"
+			json_close_object
+		done
+		json_close_array
+		json_close_object
+	done
+	json_close_array
+
+	json_add_array arrays
+	for s in /sys/block/md*; do
+		[ -e "$s/md/level" ] || continue
+		m=${s##*/}
+		json_add_object ""
+		json_add_string name "$m"
+		json_add_string level "$(cat "$s/md/level" 2>/dev/null)"
+		json_add_string sectors "$(cat "$s/size" 2>/dev/null)"
+		json_add_string state "$(cat "$s/md/array_state" 2>/dev/null)"
+		json_add_string action "$(cat "$s/md/sync_action" 2>/dev/null)"
+		json_add_string completed "$(cat "$s/md/sync_completed" 2>/dev/null)"
+		json_add_string degraded "$(cat "$s/md/degraded" 2>/dev/null)"
+		json_add_string raid_disks "$(cat "$s/md/raid_disks" 2>/dev/null)"
+		json_add_string type "$(bval "$m" TYPE)"
+		json_add_string label "$(bval "$m" LABEL)"
+		json_add_string mount "$(mnt_of "$m")"
+		json_add_array members
+		for x in "$s"/slaves/*; do [ -e "$x" ] && json_add_string "" "${x##*/}"; done
+		json_close_array
+		json_close_object
+	done
+	json_close_array
+
+	json_add_array users
+	if [ -f "$PWDDB" ]; then
+		for u in $(cut -d: -f1 "$PWDDB"); do json_add_string "" "$u"; done
+	fi
+	json_close_array
+
+	json_add_array shares
+	config_load ksmbd 2>/dev/null && config_foreach add_share share
+	json_close_array
+
+	json_dump
+}
+
+do_status() {
+	local st
+	st=$(cat "$STATE" 2>/dev/null)
+	[ -n "$st" ] || st=idle
+	if [ "$st" = running ] && ! job_running; then
+		st=error
+		echo "The task stopped unexpectedly." >> "$LOG"
+		echo error > "$STATE"
+	fi
+	json_init
+	json_add_string state "$st"
+	json_add_string log "$(tail -n 300 "$LOG" 2>/dev/null)"
+	json_dump
+}
+
+start_job() {
+	: > "$LOG"
+	echo running > "$STATE"
+	"$JOB" "$@" </dev/null >/dev/null 2>&1 &
+	echo $! > "$PIDF"
+	json_init
+	json_add_boolean started 1
+	json_dump
+}
+
+do_create() {
+	local mode disks label share sharename min max n seen d h p m
+	json_load "$1"
+	json_get_vars mode disks label share sharename
+
+	job_running && reply_error "Another task is still running. Please wait until it has finished."
+	[ "$(has fdisk)" = 1 ] || reply_error "The fdisk package is missing."
+	[ "$(has mkfs.ext4)" = 1 ] || reply_error "The e2fsprogs package (mkfs.ext4) is missing."
+
+	case "$mode" in
+		single) min=1; max=1 ;;
+		raid0|raid1)
+			[ "$(has mdadm)" = 1 ] || reply_error "The mdadm package is missing; RAID is not available."
+			min=2; max=8 ;;
+		*) reply_error "Unknown mode: $mode" ;;
+	esac
+
+	n=0; seen=" "
+	for d in $disks; do
+		case "$d" in
+			sd[a-z]|sd[a-z][a-z]) ;;
+			*) reply_error "Invalid disk: $d" ;;
+		esac
+		[ -e "/sys/block/$d" ] || reply_error "Disk $d does not exist (anymore)."
+		case "$seen" in *" $d "*) reply_error "Disk $d was selected twice." ;; esac
+		seen="$seen$d "
+		for h in /sys/block/$d/holders/* /sys/block/$d/$d*/holders/*; do
+			[ -e "$h" ] && reply_error "Disk $d is part of RAID volume ${h##*/}. Remove that volume first."
+		done
+		for p in /sys/block/$d /sys/block/$d/$d*; do
+			[ -e "$p" ] || continue
+			m=$(mnt_of "${p##*/}")
+			case "$m" in
+				/|/overlay|/rom) reply_error "Disk $d contains the system and cannot be erased." ;;
+			esac
+		done
+		n=$((n + 1))
+	done
+
+	if [ "$n" -lt "$min" ] || [ "$n" -gt "$max" ]; then
+		if [ "$mode" = single ]; then
+			reply_error "Select exactly one disk."
+		else
+			reply_error "Select at least two disks for RAID."
+		fi
+	fi
+
+	case "$label" in
+		""|*[!A-Za-z0-9_-]*) reply_error "The name may only contain letters, digits, - and _." ;;
+	esac
+	[ ${#label} -le 16 ] || reply_error "The name may be at most 16 characters long."
+
+	[ "$share" = 1 ] || share=0
+	if [ "$share" = 1 ]; then
+		[ "$(has ksmbd.adduser)" = 1 ] || reply_error "Network sharing (ksmbd) is not installed."
+		case "$sharename" in
+			""|*[!A-Za-z0-9_-]*) reply_error "The share name may only contain letters, digits, - and _." ;;
+		esac
+		[ ${#sharename} -le 32 ] || reply_error "The share name may be at most 32 characters long."
+	fi
+
+	start_job create "$mode" "$label" "$share" "$sharename" $disks
+}
+
+do_remove() {
+	local device
+	json_load "$1"
+	json_get_vars device
+	job_running && reply_error "Another task is still running. Please wait until it has finished."
+	case "$device" in
+		md[0-9]|md[0-9][0-9]|md[0-9][0-9][0-9]) ;;
+		*) reply_error "Invalid RAID volume: $device" ;;
+	esac
+	[ -e "/sys/block/$device/md" ] || reply_error "RAID volume $device does not exist."
+	[ "$(has mdadm)" = 1 ] || reply_error "The mdadm package is missing."
+	start_job remove "$device"
+}
+
+do_smart() {
+	local disk wake opt out rc
+	json_load "$1"
+	json_get_vars disk wake
+	case "$disk" in
+		sd[a-z]|sd[a-z][a-z]) ;;
+		*) reply_error "Invalid disk: $disk" ;;
+	esac
+	[ -e "/sys/block/$disk" ] || reply_error "Disk $disk does not exist."
+	[ "$(has smartctl)" = 1 ] || reply_error "The smartmontools package is missing."
+	# Do not wake up a sleeping disk unless explicitly asked to.
+	opt="-n standby"
+	[ "$wake" = 1 ] && opt=""
+	if command -v timeout >/dev/null 2>&1; then
+		out=$(timeout 25 smartctl -j -H -i -A $opt "/dev/$disk" 2>&1)
+	else
+		out=$(smartctl -j -H -i -A $opt "/dev/$disk" 2>&1)
+	fi
+	rc=$?
+	json_init
+	json_add_string json "$out"
+	json_add_int rc "$rc"
+	json_dump
+}
+
+do_poweroff() {
+	( sleep 2; /sbin/poweroff ) </dev/null >/dev/null 2>&1 &
+	json_init
+	json_add_boolean ok 1
+	json_dump
+}
+
+check_user() {
+	case "$1" in
+		""|*[!A-Za-z0-9._-]*) reply_error "The user name may only contain letters, digits, dot, - and _." ;;
+	esac
+	[ ${#1} -le 32 ] || reply_error "The user name may be at most 32 characters long."
+	[ "$(has ksmbd.adduser)" = 1 ] || reply_error "Network sharing (ksmbd) is not installed."
+}
+
+restart_ksmbd() {
+	[ -x /etc/init.d/ksmbd ] && /etc/init.d/ksmbd enabled && /etc/init.d/ksmbd restart >/dev/null 2>&1
+}
+
+do_adduser() {
+	local user password out
+	json_load "$1"
+	json_get_vars user password
+	check_user "$user"
+	[ -n "$password" ] || reply_error "Please enter a password."
+	[ ${#password} -le 128 ] || reply_error "The password is too long (max. 128 characters)."
+	case "$password" in *"$NL"*) reply_error "The password must not contain a line break." ;; esac
+
+	# Without -a/-u, ksmbd.adduser adds the user or updates the existing one.
+	out=$(ksmbd.adduser -p "$password" "$user" 2>&1) || reply_error "Adding the user failed: $out"
+	restart_ksmbd
+	json_init
+	json_add_boolean ok 1
+	json_dump
+}
+
+do_deluser() {
+	local user out
+	json_load "$1"
+	json_get_vars user
+	check_user "$user"
+	out=$(ksmbd.adduser -d "$user" 2>&1) || reply_error "Removing the user failed: $out"
+	restart_ksmbd
+	json_init
+	json_add_boolean ok 1
+	json_dump
+}
+
+case "$1" in
+	list)
+		cat <<-'EOF'
+		{
+			"list": {},
+			"status": {},
+			"create": { "mode": "single", "disks": "sda", "label": "data", "share": "1", "sharename": "data" },
+			"remove": { "device": "md0" },
+			"smart": { "disk": "sda", "wake": "0" },
+			"poweroff": {},
+			"adduser": { "user": "name", "password": "secret" },
+			"deluser": { "user": "name" }
+		}
+		EOF
+	;;
+	call)
+		input=$(cat)
+		case "$2" in
+			list)    do_list ;;
+			status)  do_status ;;
+			create)  do_create "$input" ;;
+			remove)  do_remove "$input" ;;
+			adduser) do_adduser "$input" ;;
+			deluser) do_deluser "$input" ;;
+			smart)   do_smart "$input" ;;
+			poweroff) do_poweroff ;;
+			*)       reply_error "Unknown method: $2" ;;
+		esac
+	;;
+esac

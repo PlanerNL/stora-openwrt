@@ -1,0 +1,15 @@
+{
+	"luci-app-diskprep": {
+		"description": "Disks & RAID: prepare disks, manage RAID volumes and network share users",
+		"read": {
+			"ubus": {
+				"luci.diskprep": [ "list", "status", "smart" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"luci.diskprep": [ "create", "remove", "adduser", "deluser", "poweroff" ]
+			}
+		}
+	}
+}
